@@ -13,6 +13,11 @@ testData:
   alwaysDenied:
     ip: "192.168.0.0/24"
   logLevel: "INFO"
+  urlRegexp:
+    allow:
+      - "^/computer/"
+    deny:
+      - "^/wp-login\\.php"
   rules:
     findTime: "10m"
     banTime: "3h"
