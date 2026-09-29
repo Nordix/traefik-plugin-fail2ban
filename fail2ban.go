@@ -21,11 +21,17 @@ type configIPSpec struct {
 
 // Config plugin configuration.
 type Config struct {
-	Enabled       bool         `yaml:"enabled"`
-	AlwaysAllowed configIPSpec `yaml:"alwaysAllowed"`
-	AlwaysDenied  configIPSpec `yaml:"alwaysDenied"`
-	LogLevel      string       `yaml:"logLevel"`
-	Rules         configRules  `yaml:"rules"`
+	Enabled       bool            `yaml:"enabled"`
+	AlwaysAllowed configIPSpec    `yaml:"alwaysAllowed"`
+	AlwaysDenied  configIPSpec    `yaml:"alwaysDenied"`
+	LogLevel      string          `yaml:"logLevel"`
+	URLRegexp     configURLRegexp `yaml:"urlRegexp"`
+	Rules         configRules     `yaml:"rules"`
+}
+
+type configURLRegexp struct {
+	Allow []string `yaml:"allow"`
+	Deny  []string `yaml:"deny"`
 }
 
 type configRules struct {
@@ -47,6 +53,7 @@ func CreateConfig() *Config {
 		AlwaysAllowed: configIPSpec{},
 		AlwaysDenied:  configIPSpec{},
 		LogLevel:      "INFO",
+		URLRegexp:     configURLRegexp{},
 		Rules: configRules{
 			FindTime:   "10m",
 			BanTime:    "3h",
@@ -72,6 +79,8 @@ type Fail2Ban struct {
 	enabled             bool
 	staticAllowedIPNets []*net.IPNet
 	staticDeniedIPNets  []*net.IPNet
+	allowedURLRegexps   []*regexp.Regexp
+	deniedURLRegexps    []*regexp.Regexp
 	findTime            time.Duration
 	banTime             time.Duration
 	maxRetries          uint32
@@ -92,7 +101,7 @@ func parseConfigIPList(specs []string) []*net.IPNet {
 		}
 		_, ipNet, err := net.ParseCIDR(spec)
 		if err != nil {
-			fmt.Printf("Error: %+v\n", err)
+			fmt.Printf("Error: failed to parse IP network %q: %+v\n", spec, err)
 			continue
 		}
 
@@ -100,6 +109,22 @@ func parseConfigIPList(specs []string) []*net.IPNet {
 	}
 
 	return parsedIPNets
+}
+
+func parseURLRegexps(specs []string) []*regexp.Regexp {
+	parsedRegexps := make([]*regexp.Regexp, 0, len(specs))
+
+	for _, spec := range specs {
+		reg, err := regexp.Compile(spec)
+		if err != nil {
+			fmt.Printf("Error: failed to compile URL regexp %q: %+v\n", spec, err)
+			continue
+		}
+
+		parsedRegexps = append(parsedRegexps, reg)
+	}
+
+	return parsedRegexps
 }
 
 func parseDuration(spec string, fallback time.Duration) time.Duration {
@@ -162,12 +187,59 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 		enabled:             config.Enabled,
 		staticAllowedIPNets: parseConfigIPList(config.AlwaysAllowed.IP),
 		staticDeniedIPNets:  parseConfigIPList(config.AlwaysDenied.IP),
+		allowedURLRegexps:   parseURLRegexps(config.URLRegexp.Allow),
+		deniedURLRegexps:    parseURLRegexps(config.URLRegexp.Deny),
 		findTime:            parseDuration(config.Rules.FindTime, 10*time.Minute),
 		banTime:             parseDuration(config.Rules.BanTime, 3*time.Hour),
 		maxRetries:          config.Rules.MaxRetries,
 		responseRules:       parseResponseRules(config.Rules.Response),
 		errorCode:           config.Rules.Response.ErrorCode,
 	}, nil
+}
+
+// matchURLRegexp returns the first regexp in the list that matches the given
+// URL, or nil if none match.
+func (a *Fail2Ban) matchURLRegexp(regexps []*regexp.Regexp, url string) *regexp.Regexp {
+	for _, reg := range regexps {
+		if reg.MatchString(url) {
+			return reg
+		}
+	}
+
+	return nil
+}
+
+// handleAllowedURL passes the request through untracked if it matches an allow
+// rule. It returns true if the request was handled and the caller should stop.
+func (a *Fail2Ban) handleAllowedURL(responseWriter http.ResponseWriter, request *http.Request, remoteIP, requestURL string) bool {
+	reg := a.matchURLRegexp(a.allowedURLRegexps, requestURL)
+	if reg == nil {
+		return false
+	}
+
+	a.logger.Info("Request URL matched allow rule. Access granted without counting.", "remoteIP", remoteIP, "url", requestURL, "regexp", reg.String(), "phase", "check_request", "status", "granted")
+	a.next.ServeHTTP(responseWriter, request)
+
+	return true
+}
+
+// handleDeniedURL blocks the request and registers a strike if it matches a
+// deny rule. It returns true if the request was handled and the caller should stop.
+func (a *Fail2Ban) handleDeniedURL(responseWriter http.ResponseWriter, entry *CacheEntry, remoteIP, requestURL string) bool {
+	reg := a.matchURLRegexp(a.deniedURLRegexps, requestURL)
+	if reg == nil {
+		return false
+	}
+
+	entry.IncrementTimesSeen()
+	if entry.GetTimesSeen() >= a.maxRetries {
+		entry.IssueBan()
+	}
+
+	a.logger.Info("Request URL matched deny rule. Access denied.", "remoteIP", remoteIP, "url", requestURL, "regexp", reg.String(), "timesSeen", entry.GetTimesSeen(), "phase", "check_request", "status", "denied")
+	responseWriter.WriteHeader(a.errorCode)
+
+	return true
 }
 
 func (a *Fail2Ban) ServeHTTP(responseWriter http.ResponseWriter, request *http.Request) {
@@ -203,6 +275,13 @@ func (a *Fail2Ban) ServeHTTP(responseWriter http.ResponseWriter, request *http.R
 		}
 	}
 
+	// URL allow rules take precedence over fail2ban counting: a matching
+	// request is passed through without being tracked or counted.
+	requestURL := request.URL.String()
+	if a.handleAllowedURL(responseWriter, request, remoteIP, requestURL) {
+		return
+	}
+
 	requestTime := time.Now()
 	a.cache.CleanEntries(a.findTime, a.banTime)
 	a.cache.CleanEntryIfPossible(remoteIP, a.findTime, a.banTime, requestTime)
@@ -220,7 +299,11 @@ func (a *Fail2Ban) ServeHTTP(responseWriter http.ResponseWriter, request *http.R
 	}
 	defer entry.SetLastSeen(requestTime)
 
-	// At this stage request rules might be checked (NOT YET IMPLEMENTED)
+	// URL deny rules block matching requests immediately and register a
+	// strike towards the ban limit.
+	if a.handleDeniedURL(responseWriter, entry, remoteIP, requestURL) {
+		return
+	}
 
 	// Response rules will be checked in the wrapped response writer
 	wrappedResponseWriter := &ResponseWriter{

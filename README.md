@@ -65,10 +65,42 @@ testData:
             errorCode: "403"
 ```
 
+### Allowing or blocking requests by URL pattern
+
+Requests can be allowed or blocked based on regular expressions matched against the request URL. This is useful to
+exempt specific paths from ban counting (for example endpoints that legitimately return error status codes) or to
+block known-bad paths outright.
+
+- `allow` patterns take precedence: a request whose URL matches an allow pattern is passed through immediately and is
+  never counted towards the ban limit.
+- `deny` patterns block the matching request with the configured `errorCode` and count as a strike towards the ban
+  limit.
+
+Patterns are [Go regular expressions](https://pkg.go.dev/regexp/syntax) matched against the request URL. Invalid
+patterns are logged and skipped at startup.
+
+```yaml
+testData:
+    urlRegexp:
+        allow:
+            - "^/computer/"
+        deny:
+            - "^/wp-login\\.php"
+```
+
+> **Note:** When configuring patterns via container labels or CLI parameters, traefik splits list values on commas.
+> A regular expression containing a comma (e.g. `x{2,4}`) will therefore be misinterpreted. Use a config file for such
+> patterns.
+
 ## Processing requests
 
 Prior to executing the defined rules if the Remote IP is in the `alwaysDenied`-list the request will be immediately
 denied. This applies for the `alwaysAllowed`-list accordingly.
+
+After the IP lists are evaluated, `urlRegexp.allow` patterns are checked: a matching request is passed through
+immediately, bypassing fail2ban entirely (it is neither tracked nor counted). `urlRegexp.deny` patterns are checked
+once the request is known not to be banned: a match blocks the request with the configured `errorCode` and counts as a
+strike towards the ban limit.
 
 In the first request from an unknown IP address they are added to the pool starting the `findTime` timer:
 
