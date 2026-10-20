@@ -26,3 +26,9 @@ func NewLogger(logLevel string) *logf.Logger {
 
 	return &logger
 }
+
+// isDebugLevel reports whether the configured level enables debug output.
+// Strike tracking is gated on this so it costs nothing in normal operation.
+func isDebugLevel(logLevel string) bool {
+	return strings.ToLower(logLevel) == "debug"
+}
