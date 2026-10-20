@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
@@ -86,6 +87,7 @@ type Fail2Ban struct {
 	maxRetries          uint32
 	responseRules       responseRules
 	errorCode           int
+	trackStrikes        bool
 }
 
 func parseConfigIPList(specs []string) []*net.IPNet {
@@ -194,7 +196,76 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 		maxRetries:          config.Rules.MaxRetries,
 		responseRules:       parseResponseRules(config.Rules.Response),
 		errorCode:           config.Rules.Response.ErrorCode,
+		trackStrikes:        isDebugLevel(config.LogLevel),
 	}, nil
+}
+
+// maxLoggedPathLength bounds the path recorded per strike.
+const maxLoggedPathLength = 120
+
+// sanitizePath reduces a request URL to a bounded, log-safe path. The query
+// string is dropped deliberately: it routinely carries tokens and would
+// explode the cardinality of the strike map. EscapedPath keeps any control
+// bytes percent-encoded so they cannot break the log line.
+func sanitizePath(requestURL *url.URL) string {
+	path := requestURL.EscapedPath()
+	if path == "" {
+		path = "/"
+	}
+
+	if len(path) > maxLoggedPathLength {
+		path = path[:maxLoggedPathLength] + "..."
+	}
+
+	return path
+}
+
+// formatStrikes renders strike counters into one deterministic field,
+// "/a:404=3,/b:401=1", ordered by descending count.
+func formatStrikes(strikes map[strikeKey]uint32) string {
+	type pair struct {
+		key   strikeKey
+		count uint32
+	}
+
+	pairs := make([]pair, 0, len(strikes))
+	for key, count := range strikes {
+		pairs = append(pairs, pair{key: key, count: count})
+	}
+
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].count != pairs[j].count {
+			return pairs[i].count > pairs[j].count
+		}
+
+		if pairs[i].key.Path != pairs[j].key.Path {
+			return pairs[i].key.Path < pairs[j].key.Path
+		}
+
+		return pairs[i].key.Status < pairs[j].key.Status
+	})
+
+	parts := make([]string, 0, len(pairs))
+	for _, p := range pairs {
+		parts = append(parts, fmt.Sprintf("%s:%d=%d", p.key.Path, p.key.Status, p.count))
+	}
+
+	return strings.Join(parts, ",")
+}
+
+// logBan emits the ban log line, including the accumulated per-path strike
+// counters when strike tracking is enabled. The counters are the reason the
+// client was banned; the URL of the request that happens to trip this check is
+// deliberately not logged, since it is not one of the offending requests.
+func (a *Fail2Ban) logBan(entry *CacheEntry, remoteIP, host string) {
+	fields := []any{"remoteIP", remoteIP, "maxRetries", a.maxRetries, "host", host, "banTime", a.banTime, "findTime", a.findTime, "phase", "check_request", "status", "denied"}
+
+	if a.trackStrikes {
+		strikes, truncated := entry.getStrikes()
+		fields = append(fields, "strikes", formatStrikes(strikes), "strikesTruncated", truncated)
+	}
+
+	a.logger.Info("Client has been banned.", fields...)
 }
 
 // matchURLRegexp returns the first regexp in the list that matches the given
@@ -225,7 +296,7 @@ func (a *Fail2Ban) handleAllowedURL(responseWriter http.ResponseWriter, request 
 
 // handleDeniedURL blocks the request and registers a strike if it matches a
 // deny rule. It returns true if the request was handled and the caller should stop.
-func (a *Fail2Ban) handleDeniedURL(responseWriter http.ResponseWriter, entry *CacheEntry, remoteIP, requestURL string) bool {
+func (a *Fail2Ban) handleDeniedURL(responseWriter http.ResponseWriter, entry *CacheEntry, remoteIP, requestURL, requestPath string) bool {
 	reg := a.matchURLRegexp(a.deniedURLRegexps, requestURL)
 	if reg == nil {
 		return false
@@ -234,6 +305,10 @@ func (a *Fail2Ban) handleDeniedURL(responseWriter http.ResponseWriter, entry *Ca
 	entry.IncrementTimesSeen()
 	if entry.GetTimesSeen() >= a.maxRetries {
 		entry.IssueBan()
+	}
+
+	if a.trackStrikes {
+		entry.RecordStrike(requestPath, a.errorCode)
 	}
 
 	a.logger.Info("Request URL matched deny rule. Access denied.", "remoteIP", remoteIP, "url", requestURL, "regexp", reg.String(), "timesSeen", entry.GetTimesSeen(), "phase", "check_request", "status", "denied")
@@ -282,13 +357,15 @@ func (a *Fail2Ban) ServeHTTP(responseWriter http.ResponseWriter, request *http.R
 		return
 	}
 
+	requestPath := sanitizePath(request.URL)
+
 	requestTime := time.Now()
 	a.cache.CleanEntries(a.findTime, a.banTime)
 	a.cache.CleanEntryIfPossible(remoteIP, a.findTime, a.banTime, requestTime)
 	entry := a.cache.CreateEntry(remoteIP, requestTime)
 
 	if entry.GetTimesSeen() >= a.maxRetries && !entry.IsBanned() {
-		a.logger.Info("Client has been banned.", "remoteIP", remoteIP, "maxRetries", a.maxRetries, "host", request.Host, "banTime", a.banTime, "findTime", a.findTime, "phase", "check_request", "status", "denied")
+		a.logBan(entry, remoteIP, request.Host)
 		entry.IssueBan()
 	}
 
@@ -301,7 +378,7 @@ func (a *Fail2Ban) ServeHTTP(responseWriter http.ResponseWriter, request *http.R
 
 	// URL deny rules block matching requests immediately and register a
 	// strike towards the ban limit.
-	if a.handleDeniedURL(responseWriter, entry, remoteIP, requestURL) {
+	if a.handleDeniedURL(responseWriter, entry, remoteIP, requestURL, requestPath) {
 		return
 	}
 
@@ -311,6 +388,9 @@ func (a *Fail2Ban) ServeHTTP(responseWriter http.ResponseWriter, request *http.R
 		logger:         a.logger,
 		cacheEntry:     entry,
 		rules:          a.responseRules,
+		remoteIP:       remoteIP,
+		path:           requestPath,
+		trackStrikes:   a.trackStrikes,
 	}
 
 	// Continue serving request
